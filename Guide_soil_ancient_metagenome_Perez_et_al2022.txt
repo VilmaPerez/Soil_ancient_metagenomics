@@ -1,0 +1,1076 @@
+# A BEST PRACTICE GUIDE TO MICROBIAL ANCIENT DNA ANALYSIS OF SOIL 
+# Pérez V, et al. 
+
+# QIIME2 (v.2019.20) was used for the analysis
+# Figures were created in R (v3.6.3)
+
+############################################################################################################################################
+
+# 1) EFFECT OF CONTAMINANT FILTERING: here, we assessed the presence of taxa before and after filtering contaminant taxa of the 232 datasets (analyzed with the eight bioinformatic pipelines) to determine the impact of contaminant species removal from ancient soil samples.
+
+# The collapsed reads from the 232 datasets (160 samples + 72 EBCs; "All-Taxonomy.biom”) were exported at species-level into BIOM format and imported into R (v3.6.3) for the Decontam (v.1.10.0) analysis, to detected lab contaminants 
+
+########## DECONTAM ###########
+
+### In R (v3.6.3)
+
+library(tidyverse)
+library(readr)
+library(phyloseq)
+library(ggplot2)
+library(decontam)
+library(scales)
+library(qiime2R)
+
+
+# Importing files for Decontam 
+
+data <- import_biom("All-Taxonomy.biom”)
+data_t <- t(data)
+
+metadata <- import_qiime_sample_data(“samples-metadata.txt”)
+
+data_metadata <- merge_phyloseq(data_t, metadata)
+
+# Creating a dataframe of the phyloseq object 
+
+df <- as.data.frame(sample_data(data_metadata)) 
+
+# To look at the library size 
+
+df$LibrarySize <- sample_sums(data_metadata)
+
+# Visualising the library size 
+
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=Sample_or_Control)) + geom_point()
+
+# Converting counts to relative abundance and replace NA for zeros
+
+data_metadata_RA <- transform_sample_counts(data_metadata, function(OTU)(OTU/sum(OTU)*100))
+
+otu_table(data_metadata_RA) <- replace_na(otu_table(data_metadata_RA), 0)
+
+# Calculating contaminant prevalence using a threshold=0.5
+
+contamdf.prev05 <- isContaminant(data_metadata_RA, method="prevalence", neg="is.neg", threshold=0.5)
+table(contamdf.prev05$contaminant)
+
+write.table(contamdf.prev05, file = "contam_prev05.txt")
+
+## All taxa identified as contaminants in the Decontam analysis plus all taxa found in EBC1 datasets will be eliminated from the samples datasets
+
+
+########## CALLING QIIME2 ##########
+
+# The collapsed reads from the 160 samples datasets ("samples_all.biom") were exported at species-level into BIOM format and imported into QIIME2
+
+conda activate qiime2-2019.20
+
+
+########## IMPORTING THE DATA ##########
+
+# first convert your biom (just ID, not names) file from MEGAN into a txt file 
+
+biom convert -i samples_all.biom -o samples.txt --to-tsv 
+
+### **** open your txt file in excel and remove the first row and then change "OTU ID" to "Feature ID". Then save and close ****
+
+# now you will want to convert your text file back into the hdf5 biom format 
+
+biom convert -i samples.txt  -o samples_hdf5.biom --table-type="OTU table" --to-hdf5
+
+# now convert biom table into a qiime 2 artifact. FeatureTable[Frequency] are read counts 
+
+qiime tools import \
+--input-path samples_hdf5.biom \
+--type 'FeatureTable[Frequency]' \
+--input-format BIOMV210Format \
+--output-path samples_hdf5_QIIME2.qza
+
+# Summarise the biom table 
+
+qiime feature-table summarize \
+  --i-table samples_hdf5_QIIME2.qza \
+  --o-visualization samples_hdf5_QIIME2.qzv \
+  --m-sample-metadata-file sample-metadata.txt
+
+# Also import taxonomy file which contains Feature ID and taxonomy
+
+qiime tools import  \
+--type FeatureData[Taxonomy] \
+--input-path taxonomy.txt \
+--output-path oficialtaxonomy.qza \
+--input-format HeaderlessTSVTaxonomyFormat 
+
+########## REMOVAL OF CONTAMINANTS ##########
+
+# The file ContaminantsToRemove.txt contained taxa identified as contaminants in the Decontam analysis plus all taxa found in EBC1 datasets 
+
+# The txt file has the FeatureID (first column - add contaminants list into first column) and Frequency (second column - will be empty)
+
+qiime feature-table filter-features \
+ --i-table samples_hdf5_QIIME2.qza \
+ --m-metadata-file ContaminantsToRemove.txt \
+ --p-exclude-ids \
+ --o-filtered-table samples_hdf5_QIIME2_decontamFilter.qza
+
+# summarise table
+ 
+qiime feature-table summarize \
+--i-table samples_hdf5_QIIME2_decontamFilter.qza \
+--o-visualization samples_hdf5_QIIME2_decontamFilter.qzv 
+
+#We now have the file samples_hdf5_QIIME2_decontamFilter.qza that contains the decontaminated datasets
+
+   
+########## REMOVING SINGLETONS ##########
+
+# filter out features with less than 2 reads in contaminated samples
+
+qiime feature-table filter-features \
+  --i-table samples_hdf5_QIIME2.qza \
+  --p-min-frequency 2 \
+  --o-filtered-table samples_hdf5_QIIME2_2FreqFilter.qza
+
+qiime feature-table summarize \
+--i-table samples_hdf5_QIIME2_2FreqFilter.qza \
+--o-visualization samples_hdf5_QIIME2_2FreqFilter.qzv
+
+
+# filter out features with less than 2 reads in decontaminated samples
+
+qiime feature-table filter-features \
+  --i-table samples_hdf5_QIIME2_decontamFilter.qza \
+  --p-min-frequency 2 \
+  --o-filtered-table samples_hdf5_QIIME2_decontam_2FreqFilter.qza
+
+qiime feature-table summarize \
+--i-table samples_hdf5_QIIME2_decontam_2FreqFilter.qza \
+  --m-sample-metadata-file sample-metadata.txt \
+--o-visualization samples_hdf5_QIIME2_decontam_2FreqFilter.qzv
+  
+#Information for the number of sequences per sample in contaminated and decontaminated datasets are reported in Table S2A in the manuscript 
+
+########## MERGE CONTAMINATED AND DECONTAMINATED DATASETS ##########
+
+# To compare the effect of removing contaminants we merged the tables pre-decontamination (samples_hdf5_QIIME2_2FreqFilter.qzv) and post-decontamination (samples_hdf5_QIIME2_decontam_2FreqFilter.qza)
+
+qiime feature-table merge \
+  --i-tables samples_hdf5_QIIME2_2FreqFilter.qzv \
+  --i-tables samples_hdf5_QIIME2_decontam_2FreqFilter.qza \
+  --o-merged-table samples_hdf5_QIIME2_2FreqFilter-cont_decont.qza
+
+########## ALPHA AND BETA DIVERSITY ##########
+
+#Alpha-rarefaction curves were calculated using the mean frequency per sample in the merge datasets
+
+qiime diversity alpha-rarefaction \
+  --i-table samples_hdf5_QIIME2_2FreqFilter-cont_decont.qza \
+   --p-max-depth 2636 \
+  --m-metadata-file sample-metadata.txt \
+  --o-visualization alpha-rarefaction_mean.qzv
+
+# According to the alpha-rarefaction curves we selected a minimum depth of 1000 for both contaminated and decontaminated datasets
+
+# Filter samples with less than 1000 total reads 
+
+qiime feature-table filter-samples \
+  --i-table samples_hdf5_QIIME2_2FreqFilter-cont_decont.qza \
+  --p-min-frequency 1000 \
+  --o-filtered-table samples_hdf5_QIIME2_2FreqFilter-cont_decont_rareremoved.qza
+   
+qiime feature-table summarize \
+  --i-table samples_hdf5_QIIME2_2FreqFilter-cont_decont_rareremoved.qza \
+  --o-visualization samples_hdf5_QIIME2_2FreqFilter-cont_decont_rareremoved.qzv \
+  --m-sample-metadata-file sample-metadata.txt
+
+#Now we can run core-metrics command 
+
+qiime diversity core-metrics \
+  --i-table samples_hdf5_QIIME2_2FreqFilter-cont_decont_rareremoved.qza \
+  --p-sampling-depth 1000 \
+  --m-metadata-file sample-metadata.txt  \
+  --output-dir core-metrics-results-1000rare_contam_decontam
+
+#Tabulate Observed species and Shannon index 
+
+qiime metadata tabulate \
+  --m-input-file core-metrics-results-1000rare_contam_decontam/observed_otus_vector.qza \
+  --o-visualization core-metrics-results-1000rare_contam_decontam/observed_otus_vector.qzv
+
+qiime metadata tabulate \
+  --m-input-file core-metrics-results-1000rare_contam_decontam/shannon_vector.qza \
+  --o-visualization core-metrics-results-1000rare_contam_decontam/shannon_vector.qzv
+
+# Calculate alpha (observed species and Shannon indices) and beta diversity (Bray-Curtis) statistics 
+
+qiime diversity alpha-group-significance \
+ --i-alpha-diversity core-metrics-results-1000rare_contam_decontam/observed_otus_vector.qza  \
+  --m-metadata-file sample-metadata.txt  \
+  --o-visualization core-metrics-results-1000rare_contam_decontam/observed_otus_vector_significance.qzv
+
+qiime diversity alpha-group-significance \
+ --i-alpha-diversity core-metrics-results-1000rare_contam_decontam/shannon_vector.qza \
+  --m-metadata-file sample-metadata.txt  \
+  --o-visualization core-metrics-results-1000rare_contam_decontam/shannon_vector_significance.qzv
+
+qiime diversity beta-group-significance \
+  --i-distance-matrix core-metrics-results-1000rare_contam_decontam/bray_curtis_distance_matrix.qza \
+  --m-metadata-file sample-metadata.txt \
+  --m-metadata-column decontamination \ 
+  --o-visualization core-metrics-results-1000rare_contam_decontam/bray_curtis_decontamination-significance.qzv
+
+############################################################################################################################################
+
+# 2) TAXONOMIC DIFFERENCES BETWEEN MICROBIAL COMMUNITIES OF COLLAPSED READS FROM DECONTAMINATED DATASETS AND NON-COLLAPSED READS FROM DECONTAMINATED DATASETS: After removing EBCs taxa and singletons from the communities identified using the SILVA SSU 132 database, we compared the alpha-diversity, and beta diversity of rarefied (1000 sequences at species level) using collapsed reads and non-collapsed reads. 
+
+########## DECONTAM ##########
+
+### In R (v3.6.3)
+
+library(tidyverse)
+library(readr)
+library(phyloseq)
+library(ggplot2)
+library(decontam)
+library(scales)
+library(qiime2R)
+
+
+# Importing files for Decontam 
+
+data_noncollapsed <- import_biom("All-Taxonomy_noncollapsed.biom”)
+data_t <- t(data_noncollapsed)
+
+metadata <- import_qiime_sample_data(“samples-metadata.txt”)
+
+data_metadata <- merge_phyloseq(data_t_noncollapsed, metadata)
+
+# Creating a dataframe of the phyloseq object 
+
+df <- as.data.frame(sample_data(data_metadata)) 
+
+# To look at the library size 
+
+df$LibrarySize <- sample_sums(data_metadata)
+
+# Visualising the library size 
+
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=Sample_or_Control)) + geom_point()
+
+# Converting counts to relative abundance and replace NA for zeros
+
+data_metadata_RA <- transform_sample_counts(data_metadata, function(OTU)(OTU/sum(OTU)*100))
+
+otu_table(data_metadata_RA) <- replace_na(otu_table(data_metadata_RA), 0)
+
+# Calculating contaminant prevalence using a threshold=0.5
+
+contamdf.prev05 <- isContaminant(data_metadata_RA, method="prevalence", neg="is.neg", threshold=0.5)
+table(contamdf.prev05$contaminant)
+
+write.table(contamdf.prev05, file = "contam_prev05.txt")
+
+## All taxa identified as contaminants in the Decontam analysis plus all taxa found in EBC1 datasets will be eliminated from the samples datasets
+
+
+########## CALLING QIIME2 ##########
+
+conda activate qiime2-2019.20
+
+
+########## IMPORTING THE DATA ##########
+
+# first convert your biom (just ID, not names) file from MEGAN into a txt file 
+
+biom convert -i samples_all_non-collapsed.biom -o samples_non-collapsed.txt --to-tsv 
+
+### **** open your txt file in excel and remove the first row and then change "OTU ID" to "Feature ID". Then save and close ****
+
+# now you will want to convert your text file back into the hdf5 biom format 
+
+biom convert -i samples_non-collapsed.txt  -o samples_hdf5_non-collapsed.biom --table-type="OTU table" --to-hdf5
+
+# now convert biom table into a qiime 2 artifact. FeatureTable[Frequency] are read counts 
+
+qiime tools import \
+--input-path samples_hdf5_non-collapsed.biom \
+--type 'FeatureTable[Frequency]' \
+--input-format BIOMV210Format \
+--output-path samples_hdf5_QIIME2_non-collapsed.qza
+
+# Summarise the biom table 
+
+qiime feature-table summarize \
+  --i-table samples_hdf5_QIIME2_non-collapsed.qza \
+  --o-visualization samples_hdf5_QIIME2_non-collapsed.qzv \
+  --m-sample-metadata-file sample-metadata.txt
+
+########## REMOVAL OF CONTAMINANTS ##########
+
+# The file ContaminantsToRemove.txt contained taxa identified as contaminants in the Decontam analysis plus all taxa found in EBC1 datasets 
+
+# The txt file has the FeatureID (first column - add contaminants list into first column) and Frequency (second column - will be empty)
+
+qiime feature-table filter-features \
+ --i-table samples_hdf5_QIIME2_non-collapsed.qza \
+ --m-metadata-file ContaminantsToRemove.txt \
+ --p-exclude-ids \
+ --o-filtered-table samples_hdf5_QIIME2_decont_non-collapsed.qza
+
+# summarise table
+ 
+qiime feature-table summarize \
+--i-table samples_hdf5_QIIME2_decont_non-collapsed.qza \
+--o-visualization samples_hdf5_QIIME2_decont_non-collapsed.qzv 
+
+#We now have the file samples_hdf5_QIIME2_decont_non-collapsed.qza that contains the decontaminated datasets   
+
+########## REMOVING SINGLETONS ##########
+
+# filter out features with less than 2 reads in contaminated samples
+
+qiime feature-table filter-features \
+  --i-table samples_hdf5_QIIME2_decont_non-collapsed.qza \
+  --p-min-frequency 2 \
+  --o-filtered-table samples_hdf5_QIIME2_decont_non-collapsed_2FreqFilter.qza
+
+qiime feature-table summarize \
+--i-table samples_hdf5_QIIME2_decont_non-collapsed_2FreqFilter.qza \
+--o-visualization samples_hdf5_QIIME2_decont_non-collapsed_2FreqFilter.qzv
+
+
+########## MERGE COLLAPSED AND NON-COLLAPSED DATASETS ##########
+
+# To compare the differences in microbial communities between collapsed and non-collapsed reads from decontaminated datasets we merged the tables of non-collapsed reads (samples_hdf5_QIIME2_non-collapsed_2FreqFilter.qza) and collapsed reads (samples_hdf5_QIIME2_decontam_2FreqFilter.qza)
+
+qiime feature-table merge \
+  --i-tables samples_hdf5_QIIME2_decont_non-collapsed_2FreqFilter.qza \
+  --i-tables samples_hdf5_QIIME2_decontam_2FreqFilter.qza \
+  --o-merged-table samples_hdf5_QIIME2_2FreqFilter_collapsed_non-collapsed.qza
+
+########## ALPHA AND BETA DIVERSITY ##########
+
+#Alpha-rarefaction curves were calculated using the mean frequency per sample merge datasets
+
+qiime diversity alpha-rarefaction \
+  --i-table samples_hdf5_QIIME2_2FreqFilter_collapsed_non-collapsed.qza \
+   --p-max-depth 1362 \
+  --m-metadata-file sample-metadata.txt \
+  --o-visualization alpha-rarefaction_mean.qzv
+
+# According to the alpha-rarefaction curves we selected a minimum depth of 100 reads
+
+# Filter samples with less than 100 total reads 
+
+qiime feature-table filter-samples \
+  --i-table samples_hdf5_QIIME2_2FreqFilter_collapsed_non-collapsed.qza \
+  --p-min-frequency 100 \
+  --o-filtered-table samples_hdf5_QIIME2_2FreqFilter_collapsed_non-collapsed_raremoved.qza
+   
+qiime feature-table summarize \
+  --i-table samples_hdf5_QIIME2_2FreqFilter_collapsed_non-collapsed_raremoved.qza \
+  --o-visualization samples_hdf5_QIIME2_2FreqFilter_collapsed_non-collapsed_raremoved.qzv \
+  --m-sample-metadata-file sample-metadata.txt
+
+#Now we can run core-metrics command 
+
+qiime diversity core-metrics \
+  --i-table samples_hdf5_QIIME2_2FreqFilter_collapsed_non-collapsed_raremoved.qza \
+  --p-sampling-depth 100 \
+  --m-metadata-file sample-metadata.txt  \
+  --output-dir core-metrics-results-100rare_collapsed_non-collapsed
+
+#Tabulate Observed species and Shannon diversity indices 
+
+qiime metadata tabulate \
+  --m-input-file core-metrics-results-1000rare_collapsed_non-collapsed/observed_otus_vector.qza \
+  --o-visualization core-metrics-results-1000rare_collapsed_non-collapsed/observed_otus_vector.qzv
+
+qiime metadata tabulate \
+  --m-input-file core-metrics-results-1000rare_collapsed_non-collapsed/shannon_vector.qza \
+  --o-visualization core-metrics-results-1000rare_collapsed_non-collapsed/shannon_vector.qzv
+
+# Calculate alpha (observed species and Shannon index) and beta diversity (Bray-Curtis) statistics 
+
+qiime diversity alpha-group-significance \
+ --i-alpha-diversity core-metrics-results-1000rare_collapsed_non-collapsed/observed_otus_vector.qza  \
+  --m-metadata-file sample-metadata.txt  \
+  --o-visualization core-metrics-results-1000rare_collapsed_non-collapsed/observed_otus_vector_significance.qzv
+
+qiime diversity alpha-group-significance \
+ --i-alpha-diversity core-metrics-results-1000rare_collapsed_non-collapsed/shannon_vector.qza \
+  --m-metadata-file sample-metadata.txt  \
+  --o-visualization core-metrics-results-1000rare_collapsed_non-collapsed/shannon_vector_significance.qzv
+
+qiime diversity beta-group-significance \
+  --i-distance-matrix core-metrics-results-1000rare_collapsed_non-collapsed/bray_curtis_distance_matrix.qza \
+  --m-metadata-file sample-metadata.txt \
+  --m-metadata-column collapsing \ 
+  --o-visualization core-metrics-results-1000rare_collapsed_non-collapsed/bray_curtis_reads_collapsing-significance.qzv
+
+############################################################################################################################################
+
+# 3) TAXONOMIC BIASES OF DNA EXTRACTIONS METHODS AND BIOINFORMATIC PIPELINES: After removing EBCs taxa and singletons from the communities identified using the SILVA SSU 132 database, we compared the alpha-diversity, and beta diversity of rarefied (1000 sequences at species level), decontaminated datasets obtained using the five different extraction methods. 
+
+# For this analysis we used the file samples_hdf5_QIIME2_decontam_2FreqFilter.qza (post-decontaminated, singleton removed datasets) 
+
+########## ALPHA AND BETA DIVERSITY ##########
+
+#Alpha-rarefaction curves were calculated using the mean frequency per sample 
+
+qiime diversity alpha-rarefaction \
+  --i-table samples_NO_hdf5_QIIME2_decontam_2FreqFilter.qza \
+   --p-max-depth 2165 \
+  --m-metadata-file sample-metadata.txt \
+  --o-visualization alpha-rarefaction_mean.qzv
+
+
+# According to the alpha-rarefaction curves we selected a minimum depth of 1000 for both contaminated and decontaminated datasets
+
+# Filter samples with less than 1000 total reads 
+
+qiime feature-table filter-samples \
+  --i-table samples_hdf5_QIIME2_decontam_2FreqFilter.qza \
+  --p-min-frequency 1000 \
+  --o-filtered-table samples_hdf5_QIIME2_decontam_2FreqFilter_rareremoved.qza
+   
+qiime feature-table summarize \
+  --i-table samples_hdf5_QIIME2_decontam_2FreqFilter_rareremoved.qza \
+  --o-visualization samples_hdf5_QIIME2_decontam_2FreqFilter_rareremoved.qzv \
+  --m-sample-metadata-file sample-metadata.txt
+
+#Now we can run core-metrics command 
+
+qiime diversity core-metrics \
+  --i-table samples_hdf5_QIIME2_decontam_2FreqFilter_rareremoved.qza \
+  --p-sampling-depth 1000 \
+  --m-metadata-file sample-metadata.txt  \
+  --output-dir core-metrics-results-1000rare_decontam
+
+#Tabulate Observed species and Shannon index 
+
+qiime metadata tabulate \
+  --m-input-file core-metrics-results-1000rare_decontam/observed_otus_vector.qza \
+  --o-visualization core-metrics-results-1000rare_decontam/observed_otus_vector.qzv
+
+qiime metadata tabulate \
+  --m-input-file core-metrics-results-1000rare_decontam/shannon_vector.qza \
+  --o-visualization core-metrics-results-1000rare_decontam/shannon_vector.qzv
+
+# Calculate alpha (observed species and Shannon index) and beta diversity (Bray-Curtis) statistics 
+
+qiime diversity alpha-group-significance \
+ --i-alpha-diversity core-metrics-results-1000rare_decontam/observed_otus_vector.qza  \
+  --m-metadata-file sample-metadata.txt  \
+  --o-visualization core-metrics-results-1000rare_decontam/observed_otus_vector_significance.qzv
+
+qiime diversity alpha-group-significance \
+ --i-alpha-diversity core-metrics-results-1000rare_decontam/shannon_vector.qza \
+  --m-metadata-file sample-metadata.txt  \
+  --o-visualization core-metrics-results-1000rare_decontam/shannon_vector_significance.qzv
+
+qiime diversity beta-group-significance \
+  --i-distance-matrix core-metrics-results-1000rare_decontam/bray_curtis_distance_matrix.qza \
+  --m-metadata-file sample-metadata.txt \
+  --m-metadata-column extraction_protocol 
+  --o-visualization core-metrics-results-1000rare_decontam/bray_curtis_extraction_protocol-pairwisesignificance.qzv
+
+qiime diversity beta-group-significance \
+  --i-distance-matrix core-metrics-results-1000rare_decontam/bray_curtis_distance_matrix.qza \
+  --m-metadata-file sample-metadata.txt \
+  --m-metadata-column preprocessing_software \ 
+  --o-visualization core-metrics-results-1000rare_decontam/bray_curtis_preprocessing_software-significance.qzv
+
+qiime diversity beta-group-significance \
+  --i-distance-matrix core-metrics-results-1000rare_decontam/bray_curtis_distance_matrix.qza \
+  --m-metadata-file sample-metadata.txt \
+  --m-metadata-column complexity_filter \
+  --o-visualization core-metrics-results-1000rare_decontam/bray_curtis_complexity_threshold-significance.qzv
+
+qiime diversity beta-group-significance \
+  --i-distance-matrix core-metrics-results-1000rare_decontam/bray_curtis_distance_matrix.qza \
+  --m-metadata-file sample-metadata.txt \
+  --m-metadata-column deduplication \ 
+  --o-visualization core-metrics-results-1000rare_decontam/bray_curtis_deduplication-significance.qzv
+
+########## TAXONOMIC BAR PLOT  ##########
+
+#Separate by domainin QIIME2
+
+#Bacteria
+qiime taxa filter-table \
+--i-table samples_hdf5_QIIME2_decontam_2FreqFilter.qza \
+--i-taxonomy oficialtaxonomy.qza \
+--p-include d__Bacteria \
+--o-filtered-table samples_hdf5_QIIME2_decontam_2FreqFilter-Bacteria.qza
+
+#Archaea
+qiime taxa filter-table \
+--i-table samples_hdf5_QIIME2_decontam_2FreqFilter.qza \
+--i-taxonomy oficialtaxonomy.qza \
+--p-include d__Archaea \
+--o-filtered-table samples_hdf5_QIIME2_decontam_2FreqFilter-Archaea.qza
+
+#Eukaryota 
+qiime taxa filter-table \
+--i-table samples_hdf5_QIIME2_decontam_2FreqFilter.qza \
+--i-taxonomy oficialtaxonomy.qza \
+--p-include d__Eukaryota \
+--o-filtered-table samples_hdf5_QIIME2_decontam_2FreqFilter-Eukaryota.qza
+
+#plot separated tables
+# In R (v3.6.3)
+
+library(ggplot2)
+library(gplots)
+library(phyloseq)
+library(plotly)
+library(tidyr)
+library(readr)
+library(scales)
+library(qiime2R)
+library(tidyverse)
+
+# First we want to import all of our data
+
+# metadata 
+metadata<-read_tsv("sample-metadata.txt")
+
+# SILVA taxonomy file  
+silva_taxonomy <- read_qza("oficialtaxonomy.qza")
+taxtable<-silva_taxonomy$data %>% as.tibble() %>% separate(Taxon, sep=";", c("Kingdom","Phylum","Class","Order","Family","Genus","Species")) 
+
+Bacteria <- read_qza("samples_hdf5_QIIME2_decontam_2FreqFilter-Bacteria.qza")
+Archaea <- read_qza("samples_hdf5_QIIME2_decontam_2FreqFilter-Archaea.qza")
+Eukaryota <- read_qza("samples_hdf5_QIIME2_decontam_2FreqFilter-Eukaryota.qza")
+
+# creating a phyloseq object 
+bacteria_phylo <- phyloseq(otu_table$Bacteria, tax_table(as.data.frame(taxtable) %>% column_to_rownames("Feature.ID") %>% as.matrix()), sample_data(metadata %>% as.data.frame() %>% column_to_rownames("#SampleID")))
+
+archaea_phylo <- phyloseq(otu_table$Archaea, tax_table(as.data.frame(taxtable) %>% column_to_rownames("Feature.ID") %>% as.matrix()), sample_data(metadata %>% as.data.frame() %>% column_to_rownames("#SampleID")))
+
+eukaryota_phylo <- phyloseq(otu_table$Eukaryota, tax_table(as.data.frame(taxtable) %>% column_to_rownames("Feature.ID") %>% as.matrix()), sample_data(metadata %>% as.data.frame() %>% column_to_rownames("#SampleID")))
+
+## Now you will want to change the counts to relative abundance 
+bacteria.RA <- transform_sample_counts(bacteria_phylo, function(x)(x/sum(x)*100))
+archaea.RA <- transform_sample_counts(archaea_phylo, function(x)(x/sum(x)*100))
+eukaryota.RA <- transform_sample_counts(eukaryota_phylo, function(x)(x/sum(x)*100))
+
+# Replace NaN of samples with zero counts, for Zeroes
+bacteria.RA@otu_table[is.nan(bacteria.RA@otu_table)] <- 0
+archaea.RA@otu_table[is.nan(archaea.RA@otu_table)] <- 0
+eukaryota.RA@otu_table[is.nan(eukaryota.RA@otu_table)] <- 0
+
+##### to agglomerate your taxaplot to a singe taxonomic rank and convert to a dataframe 
+glom_B <- tax_glom(bacteria.RA, taxrank = 'Phylum', NArm=FALSE) 
+data_glom_B<- psmelt(glom_B) 	
+data_glom_B$Phylum <- as.character(data_glom_B$Phylum) 	
+
+glom_A <- tax_glom(archaea.RA, taxrank = 'Phylum', NArm=FALSE) 
+data_glom_A<- psmelt(glom_A) 	
+data_glom_A$Phylum <- as.character(data_glom_A$Phylum) 	
+
+glom_E <- tax_glom(eukaryota.RA, taxrank = 'Phylum', NArm=FALSE) 
+data_glom_E<- psmelt(glom_E) 	
+data_glom_E$Phylum <- as.character(data_glom_E$Phylum) 	
+
+## taxonomic barplots in Figure 3 in manuscript
+
+bacteria_PHYLUM <- ggplot(data=data_glom_B, aes(x=Sample, y=Abundance, fill=Phylum)) + theme_bw()
+
+bacteria <- bacteria_PHYLUM + geom_bar(aes(), stat="identity", position="stack") + theme(legend.position = "none") + theme(axis.text.x = element_blank()) + theme(axis.title.y=element_blank()) + theme(axis.title.x=element_blank()) + theme(axis.text.y = element_text(size=17, face = "bold")) + ggtitle("Sample 1") + theme(plot.title = element_text(face = "bold", size = 17)) + scale_y_continuous(labels = label_scientific(digits = 1), breaks=c(0, 1000, 2000, 3000), limits=c(0, 3000), expand = expand_scale(mult = c(0, 0)))
+
+## taxonomic barplots in Figure 4 in manuscript
+
+archaea_PHYLUM <- ggplot(data=data_glom_A, aes(x=Sample, y=Abundance, fill=Phylum)) + theme_bw()
+
+bacteria <- archaea_PHYLUM + geom_bar(aes(), stat="identity", position="stack") + theme(legend.position = "none") + theme(axis.text.x = element_blank()) + theme(axis.title.y=element_blank()) + theme(axis.title.x=element_blank()) + theme(axis.text.y = element_text(size=17, face = "bold")) + ggtitle("Sample 1") + theme(plot.title = element_text(face = "bold", size = 17)) + scale_y_continuous(labels = label_scientific(digits = 1), breaks=c(0, 1000, 2000, 3000), limits=c(0, 3000), expand = expand_scale(mult = c(0, 0)))
+
+## taxonomic barplots in Figure 5 in manuscript
+
+eukaryote_PHYLUM <- ggplot(data=data_glom_E, aes(x=Sample, y=Abundance, fill=Phylum)) + theme_bw()
+
+eukaryote <- eukaryota_PHYLUM + geom_bar(aes(), stat="identity", position="stack") + theme(legend.position = "none") + theme(axis.text.x = element_blank()) + theme(axis.title.y=element_blank()) + theme(axis.title.x=element_blank()) + theme(axis.text.y = element_text(size=17, face = "bold")) + ggtitle("Sample 1") + theme(plot.title = element_text(face = "bold", size = 17)) + scale_y_continuous(labels = label_scientific(digits = 1), breaks=c(0, 1000, 2000, 3000), limits=c(0, 3000), expand = expand_scale(mult = c(0, 0)))
+
+############################################################################################################################################
+
+# 4) IMPACT OF REFERENCE DATABASE SELECTION ON SPECIES RECOVERY: We next examined the impact of reference databases on the reconstruction of microbial communities by comparing the collapsed, preprocessed and decontaminated sequences from our selected pipeline and the five extraction methods using four databases: SILVA SSU 132; RefSeq, NCBI, and GTDB.
+
+########## DECONTAM ##########
+
+### In R (v3.6.3)
+
+library(tidyverse)
+library(readr)
+library(phyloseq)
+library(ggplot2)
+library(decontam)
+library(scales)
+library(qiime2R)
+
+# Importing files for Decontam 
+
+#SILVA
+
+data_SILVA <- import_biom("All-Taxonomy_SILVA.biom”)
+data_t_SILVA <- t(data_SILVA)
+metadata <- import_qiime_sample_data(“samples-metadata.txt”)
+data_metadata_SILVA <- merge_phyloseq(data_t_SILVA, metadata)
+df_SILVA <- as.data.frame(sample_data(data_metadata_SILVA)) 
+df_SILVA$LibrarySize <- sample_sums(data_metadata_SILVA)
+df_SILVA <- df_SILVA[order(df$LibrarySize),]
+df_SILVA$Index <- seq(nrow(df_SILVA))
+ggplot(data=df_SILVA, aes(x=Index, y=LibrarySize, color=Sample_or_Control)) + geom_point()
+data_metadata_RA_SILVA <- transform_sample_counts(data_metadata_SILVA, function(OTU)(OTU/sum(OTU)*100))
+otu_table(data_metadata_RA_SILVA) <- replace_na(otu_table(data_metadata_RA_SILVA), 0)
+contamdf.prev05_SILVA <- isContaminant(data_metadata_RA_SILVA, method="prevalence", neg="is.neg", threshold=0.5)
+table(contamdf.prev05_SILVA$contaminant)
+
+## All taxa identified as contaminants in the Decontam analysis plus all taxa found in EBC1 datasets will be eliminated from the samples datasets
+
+#REFSEQ
+
+data_REFSEQ <- import_biom("All-Taxonomy_REFSEQ.biom”)
+data_t_REFSEQ <- t(data_REFSEQ)
+metadata <- import_qiime_sample_data(“samples-metadata.txt”)
+data_metadata_REFSEQ <- merge_phyloseq(data_t_REFSEQ, metadata)
+df_REFSEQ <- as.data.frame(sample_data(data_metadata_REFSEQ)) 
+df_REFSEQ$LibrarySize <- sample_sums(data_metadata_REFSEQ)
+df_REFSEQ <- df_REFSEQ[order(df$LibrarySize),]
+df_REFSEQ$Index <- seq(nrow(df_REFSEQ))
+ggplot(data=df_REFSEQ, aes(x=Index, y=LibrarySize, color=Sample_or_Control)) + geom_point()
+data_metadata_RA_REFSEQ <- transform_sample_counts(data_metadata_REFSEQ, function(OTU)(OTU/sum(OTU)*100))
+otu_table(data_metadata_RA_REFSEQ) <- replace_na(otu_table(data_metadata_RA_REFSEQ), 0)
+contamdf.prev05_REFSEQ <- isContaminant(data_metadata_RA_REFSEQ, method="prevalence", neg="is.neg", threshold=0.5)
+table(contamdf.prev05_REFSEQ$contaminant)
+
+## All taxa identified as contaminants in the Decontam analysis plus all taxa found in EBC1 datasets will be eliminated from the samples datasets
+
+#NT
+
+data_NT <- import_biom("All-Taxonomy_NT.biom”)
+data_t_NT <- t(data_NT)
+metadata <- import_qiime_sample_data(“samples-metadata.txt”)
+data_metadata_NT <- merge_phyloseq(data_t_NT, metadata)
+df_NT <- as.data.frame(sample_data(data_metadata_NT)) 
+df_NT$LibrarySize <- sample_sums(data_metadata_NT)
+df_NT <- df_NT[order(df$LibrarySize),]
+df_NT$Index <- seq(nrow(df_NT))
+ggplot(data=df_NT, aes(x=Index, y=LibrarySize, color=Sample_or_Control)) + geom_point()
+data_metadata_RA_NT <- transform_sample_counts(data_metadata_NT, function(OTU)(OTU/sum(OTU)*100))
+otu_table(data_metadata_RA_NT) <- replace_na(otu_table(data_metadata_RA_NT), 0)
+contamdf.prev05_NT <- isContaminant(data_metadata_RA_NT, method="prevalence", neg="is.neg", threshold=0.5)
+table(contamdf.prev05_NT$contaminant)
+
+## All taxa identified as contaminants in the Decontam analysis plus all taxa found in EBC1 datasets will be eliminated from the samples datasets
+
+
+#GTDB
+
+data_GTDB <- import_biom("All-Taxonomy_GTDB.biom”)
+data_t_GTDB <- t(data_GTDB)
+metadata <- import_qiime_sample_data(“samples-metadata.txt”)
+data_metadata_GTDB <- merge_phyloseq(data_t_GTDB, metadata)
+df_GTDB <- as.data.frame(sample_data(data_metadata_GTDB)) 
+df_GTDB$LibrarySize <- sample_sums(data_metadata_GTDB)
+df_GTDB <- df_GTDB[order(df$LibrarySize),]
+df_GTDB$Index <- seq(nrow(df_GTDB))
+ggplot(data=df_GTDB, aes(x=Index, y=LibrarySize, color=Sample_or_CoGTDBrol)) + geom_poiGTDB()
+data_metadata_RA_GTDB <- transform_sample_couGTDBs(data_metadata_GTDB, function(OTU)(OTU/sum(OTU)*100))
+otu_table(data_metadata_RA_GTDB) <- replace_na(otu_table(data_metadata_RA_GTDB), 0)
+coGTDBamdf.prev05_GTDB <- isCoGTDBaminaGTDB(data_metadata_RA_GTDB, method="prevalence", neg="is.neg", threshold=0.5)
+table(coGTDBamdf.prev05_GTDB$coGTDBaminaGTDB)
+
+## All taxa identified as contaminants in the Decontam analysis plus all taxa found in EBC1 datasets will be eliminated from the samples datasets
+
+########## CALLING QIIME2 ##########
+
+conda activate qiime2-2019.20
+
+
+########## IMPORTING THE DATA ##########
+
+#SILVA
+# first convert your biom (just ID, not names) file from MEGAN into a txt file 
+
+biom convert -i samples_all_SILVA.biom -o samples_SILVA.txt --to-tsv 
+
+### **** open your txt file in excel and remove the first row and then change "OTU ID" to "Feature ID". Then save and close ****
+
+# now you will want to convert your text file back into the hdf5 biom format 
+
+biom convert -i samples_SILVA.txt  -o samples_hdf5_SILVA.biom --table-type="OTU table" --to-hdf5
+
+# now convert biom table into a qiime 2 artifact. FeatureTable[Frequency] are read counts 
+
+qiime tools import \
+--input-path samples_hdf5_SILVA.biom \
+--type 'FeatureTable[Frequency]' \
+--input-format BIOMV210Format \
+--output-path samples_hdf5_QIIME2_SILVA.qza
+
+# Summarise the biom table 
+
+qiime feature-table summarize \
+  --i-table samples_hdf5_QIIME2_SILVA.qza \
+  --o-visualization samples_hdf5_QIIME2_SILVA.qzv \
+  --m-sample-metadata-file sample-metadata.txt
+
+# Also import taxonomy file which contains Feature ID and taxonomy
+
+qiime tools import  \
+--type FeatureData[Taxonomy] \
+--input-path taxonomy_SILVA.txt \
+--output-path oficialtaxonomy_SILVA.qza \
+--input-format HeaderlessTSVTaxonomyFormat
+
+#REFSEQ
+
+biom convert -i samples_all_REFSEQ.biom -o samples_REFSEQ.txt --to-tsv 
+
+biom convert -i samples_REFSEQ.txt  -o samples_hdf5_REFSEQ.biom --table-type="OTU table" --to-hdf5
+
+qiime tools import \
+--input-path samples_hdf5_REFSEQ.biom \
+--type 'FeatureTable[Frequency]' \
+--input-format BIOMV210Format \
+--output-path samples_hdf5_QIIME2_REFSEQ.qza
+
+qiime feature-table summarize \
+  --i-table samples_hdf5_QIIME2_REFSEQ.qza \
+  --o-visualization samples_hdf5_QIIME2_REFSEQ.qzv \
+  --m-sample-metadata-file sample-metadata.txt
+
+# Also import taxonomy file which contains Feature ID and taxonomy
+
+qiime tools import  \
+--type FeatureData[Taxonomy] \
+--input-path taxonomy_REFSEQ.txt \
+--output-path oficialtaxonomy_REFSEQ.qza \
+--input-format HeaderlessTSVTaxonomyFormat
+
+#NT
+biom convert -i samples_all_NT.biom -o samples_NT.txt --to-tsv 
+
+biom convert -i samples_NT.txt  -o samples_hdf5_NT.biom --table-type="OTU table" --to-hdf5
+
+qiime tools import \
+--input-path samples_hdf5_NT.biom \
+--type 'FeatureTable[Frequency]' \
+--input-format BIOMV210Format \
+--output-path samples_hdf5_QIIME2_NT.qza
+
+qiime feature-table summarize \
+  --i-table samples_hdf5_QIIME2_NT.qza \
+  --o-visualization samples_hdf5_QIIME2_NT.qzv \
+  --m-sample-metadata-file sample-metadata.txt
+
+# Also import taxonomy file which contains Feature ID and taxonomy
+
+qiime tools import  \
+--type FeatureData[Taxonomy] \
+--input-path taxonomy_NT.txt \
+--output-path oficialtaxonomy_NT.qza \
+--input-format HeaderlessTSVTaxonomyFormat
+
+#GTDB
+
+biom convert -i samples_all_GTDB.biom -o samples_GTDB.txt --to-tsv 
+
+biom convert -i samples_GTDB.txt  -o samples_hdf5_GTDB.biom --table-type="OTU table" --to-hdf5
+
+qiime tools import \
+--input-path samples_hdf5_GTDB.biom \
+--type 'FeatureTable[Frequency]' \
+--input-format BIOMV210Format \
+--output-path samples_hdf5_QIIME2_GTDB.qza
+
+qiime feature-table summarize \
+  --i-table samples_hdf5_QIIME2_GTDB.qza \
+  --o-visualization samples_hdf5_QIIME2_GTDB.qzv \
+  --m-sample-metadata-file sample-metadata.txt
+
+# Also import taxonomy file which contains Feature ID and taxonomy
+
+qiime tools import  \
+--type FeatureData[Taxonomy] \
+--input-path taxonomy_GTDB.txt \
+--output-path oficialtaxonomy_GTDB.qza \
+--input-format HeaderlessTSVTaxonomyFormat
+
+########## REMOVAL OF CONTAMINANTS ##########
+
+# The file ContaminantsToRemove.txt contained taxa identified as contaminants in the Decontam analysis plus all taxa found in EBC1 datasets 
+
+# The txt file has the FeatureID (first column - add contaminants list into first column) and Frequency (second column - will be empty)
+
+#SILVA
+qiime feature-table filter-features \
+ --i-table samples_hdf5_QIIME2_SILVA.qza \
+ --m-metadata-file ContaminantsToRemove.txt \
+ --p-exclude-ids \
+ --o-filtered-table samples_hdf5_QIIME2_decont_SILVA.qza
+
+#REFSEQ
+qiime feature-table filter-features \
+ --i-table samples_hdf5_QIIME2_REFSEQ.qza \
+ --m-metadata-file ContaminantsToRemove.txt \
+ --p-exclude-ids \
+ --o-filtered-table samples_hdf5_QIIME2_decont_REFSEQ.qza
+
+#NT
+qiime feature-table filter-features \
+ --i-table samples_hdf5_QIIME2_NT.qza \
+ --m-metadata-file ContaminantsToRemove.txt \
+ --p-exclude-ids \
+ --o-filtered-table samples_hdf5_QIIME2_decont_NT.qza
+
+#GTDB
+qiime feature-table filter-features \
+ --i-table samples_hdf5_QIIME2_GTDB.qza \
+ --m-metadata-file ContaminantsToRemove.txt \
+ --p-exclude-ids \
+ --o-filtered-table samples_hdf5_QIIME2_decont_GTDB.qza
+
+########## REMOVING SINGLETONS ##########
+
+# filter out features with less than 2 reads in contaminated samples
+
+#SILVA
+
+qiime feature-table filter-features \
+  --i-table samples_hdf5_QIIME2_decont_SILVA.qza \
+  --p-min-frequency 2 \
+  --o-filtered-table samples_hdf5_QIIME2_decont_SILVA_2FreqFilter.qza
+
+#REFSEQ
+
+qiime feature-table filter-features \
+  --i-table samples_hdf5_QIIME2_decont_REFSEQ.qza \
+  --p-min-frequency 2 \
+  --o-filtered-table samples_hdf5_QIIME2_decont_REFSEQ_2FreqFilter.qza
+
+#NT
+
+qiime feature-table filter-features \
+  --i-table samples_hdf5_decont_QIIME2_NT.qza \
+  --p-min-frequency 2 \
+  --o-filtered-table samples_hdf5_QIIME2_decont_NT_2FreqFilter.qza
+
+#GTDB
+
+qiime feature-table filter-features \
+  --i-table samples_hdf5_QIIME2_decont_GTDB.qza \
+  --p-min-frequency 2 \
+  --o-filtered-table samples_hdf5_QIIME2_decont_GTDB_2FreqFilter.qza
+
+########## MERGE DATASETS FROM THE FOUR DATABASES ##########
+
+qiime feature-table merge \
+  --i-tables samples_hdf5_QIIME2_decont_SILVA_2FreqFilter.qza \
+  --i-tables samples_hdf5_QIIME2_decont_REFSEQ_2FreqFilter.qza \
+  --i-tables samples_hdf5_QIIME2_decont_NT_2FreqFilter.qza \
+  --i-tables samples_hdf5_QIIME2_decont_GTDB_2FreqFilter.qza \
+  --o-merged-table samples_hdf5_QIIME2_2FreqFilter_databases.qza
+
+########## ALPHA AND BETA DIVERSITY ##########
+
+#Alpha-rarefaction curves were calculated using the mean frequency per sample 
+
+qiime diversity alpha-rarefaction \
+  --i-table samples_hdf5_QIIME2_2FreqFilter_databases.qza \
+   --p-max-depth 2165 \
+  --m-metadata-file sample-metadata.txt \
+  --o-visualization alpha-rarefaction_mean.qzv
+
+
+# According to the alpha-rarefaction curves we selected a minimum depth of 462 reads
+
+# Filter samples with less than 462 total reads 
+
+qiime feature-table filter-samples \
+  --i-table samples_hdf5_QIIME2_2FreqFilter_databases.qza \
+  --p-min-frequency 462 \
+  --o-filtered-table samples_hdf5_QIIME2_2FreqFilter_databases_raremoved.qza
+   
+qiime feature-table summarize \
+  --i-table samples_hdf5_QIIME2_2FreqFilter_databases_raremoved.qza \
+  --o-visualization samples_hdf5_QIIME2_2FreqFilter_databases_raremoved.qzv \
+  --m-sample-metadata-file sample-metadata.txt
+
+#Now we can run core-metrics command 
+
+qiime diversity core-metrics \
+  --i-table samples_hdf5_QIIME2_2FreqFilter_databases_raremoved.qza \
+  --p-sampling-depth 462 \
+  --m-metadata-file sample-metadata.txt  \
+  --output-dir core-metrics-results-462rare_databases
+
+#Tabulate Observed species and Shannon index 
+
+qiime metadata tabulate \
+  --m-input-file core-metrics-results-462rare_databases/observed_otus_vector.qza \
+  --o-visualization core-metrics-results-462rare_databases/observed_otus_vector.qzv
+
+qiime metadata tabulate \
+  --m-input-file core-metrics-results-462rare_databases/shannon_vector.qza \
+  --o-visualization core-metrics-results-462rare_databases/shannon_vector.qzv
+
+# Calculate alpha (observed species and Shannon index) and beta diversity (Bray-Curtis) statistics 
+
+qiime diversity alpha-group-significance \
+ --i-alpha-diversity core-metrics-results-462rare_databases/observed_otus_vector.qza  \
+  --m-metadata-file sample-metadata.txt  \
+  --o-visualization core-metrics-results-462rare_databases/observed_otus_vector_significance.qzv
+
+qiime diversity alpha-group-significance \
+ --i-alpha-diversity core-metrics-results-462rare_databases/shannon_vector.qza \
+  --m-metadata-file sample-metadata.txt  \
+  --o-visualization core-metrics-results-462rare_databases/shannon_vector_significance.qzv
+
+qiime diversity beta-group-significance \
+  --i-distance-matrix core-metrics-results-462rare_databases/bray_curtis_distance_matrix.qza \
+  --m-metadata-file sample-metadata.txt \
+  --m-metadata-column databases \ 
+  --o-visualization core-metrics-results-462rare_databases/bray_curtis_databases-significance.qzv
+
+########## TAXONOMIC BAR PLOT  ##########
+
+#Separate by domain in QIIME2
+
+#SILVA_Bacteria
+qiime taxa filter-table \
+--i-table samples_hdf5_QIIME2_decont_SILVA_2FreqFilter.qza \
+--i-taxonomy oficialtaxonomy_SILVA.qza \
+--p-include d__Bacteria \
+--o-filtered-table samples_hdf5_QIIME2_decontam_2FreqFilter-Bacteria_SILVA.qza
+
+#REFSEQ_Bacteria
+qiime taxa filter-table \
+--i-table samples_hdf5_QIIME2_decont_REFSEQ_2FreqFilter.qza \
+--i-taxonomy oficialtaxonomy_REFSEQ.qza \
+--p-include d__Bacteria \
+--o-filtered-table samples_hdf5_QIIME2_decontam_2FreqFilter-Bacteria_REFSEQ.qza
+
+#NT_Bacteria
+qiime taxa filter-table \
+--i-table samples_hdf5_QIIME2_decont_NT_2FreqFilter.qza \
+--i-taxonomy oficialtaxonomy_NT.qza \
+--p-include d__Bacteria \
+--o-filtered-table samples_hdf5_QIIME2_decontam_2FreqFilter-Bacteria_NT.qza
+
+#GTDB_Bacteria
+qiime taxa filter-table \
+--i-table samples_hdf5_QIIME2_decont_GTDB_2FreqFilter.qza \
+--i-taxonomy oficialtaxonomy_GTDB.qza \
+--p-include d__Bacteria \
+--o-filtered-table samples_hdf5_QIIME2_decontam_2FreqFilter-Bacteria_GTDB.qza
+
+#plot separated tables
+# In R (v3.6.3)
+
+library(ggplot2)
+library(gplots)
+library(phyloseq)
+library(plotly)
+library(tidyr)
+library(readr)
+library(scales)
+library(qiime2R)
+library(tidyverse)
+
+# First we want to import all of our data
+
+# metadata 
+metadata<-read_tsv("sample-metadata.txt")
+
+# Taxonomy file  
+silva_taxonomy <- read_qza("oficialtaxonomy_SILVA.qza")
+taxtable<-silva_taxonomy$data %>% as.tibble() %>% separate(Taxon, sep=";", c("Kingdom","Phylum","Class","Order","Family","Genus","Species")) 
+
+refseq_taxonomy <- read_qza("oficialtaxonomy_REFSEQ.qza")
+taxtable<-refseq_taxonomy$data %>% as.tibble() %>% separate(Taxon, sep=";", c("Kingdom","Phylum","Class","Order","Family","Genus","Species")) 
+
+nt_taxonomy <- read_qza("oficialtaxonomy_NT.qza")
+taxtable<-nt_taxonomy$data %>% as.tibble() %>% separate(Taxon, sep=";", c("Kingdom","Phylum","Class","Order","Family","Genus","Species")) 
+
+gtdb_taxonomy <- read_qza("oficialtaxonomy_GTDB.qza")
+taxtable<-gtdb_taxonomy$data %>% as.tibble() %>% separate(Taxon, sep=";", c("Kingdom","Phylum","Class","Order","Family","Genus","Species")) 
+
+#sample tables
+
+Bacteria_silva <- read_qza("samples_hdf5_QIIME2_decontam_2FreqFilter-Bacteria_SILVA.qza")
+Bacteria_refseq <- read_qza("samples_hdf5_QIIME2_decontam_2FreqFilter-Bacteria_REFSEQ.qza")
+Bacteria_nt <- read_qza("samples_hdf5_QIIME2_decontam_2FreqFilter-Bacteria_NT.qza")
+Bacteria_gtdb <- read_qza("samples_hdf5_QIIME2_decontam_2FreqFilter-Bacteria_GTDB.qza")
+
+
+# creating a phyloseq object 
+bacteria_phylo_SILVA <- phyloseq(otu_table$Bacteria_silva, tax_table(as.data.frame(taxtable) %>% column_to_rownames("Feature.ID") %>% as.matrix()), sample_data(metadata %>% as.data.frame() %>% column_to_rownames("#SampleID")))
+
+bacteria_phylo_REFSEQ <- phyloseq(otu_table$Bacteria_refseq, tax_table(as.data.frame(taxtable) %>% column_to_rownames("Feature.ID") %>% as.matrix()), sample_data(metadata %>% as.data.frame() %>% column_to_rownames("#SampleID")))
+
+bacteria_phylo_NT <- phyloseq(otu_table$Bacteria_nt, tax_table(as.data.frame(taxtable) %>% column_to_rownames("Feature.ID") %>% as.matrix()), sample_data(metadata %>% as.data.frame() %>% column_to_rownames("#SampleID")))
+
+bacteria_phylo_GTDB <- phyloseq(otu_table$Bacteria_gtdb, tax_table(as.data.frame(taxtable) %>% column_to_rownames("Feature.ID") %>% as.matrix()), sample_data(metadata %>% as.data.frame() %>% column_to_rownames("#SampleID")))
+
+## Now you will want to change the counts to relative abundance 
+bacteria.RA_silva <- transform_sample_counts(bacteria_phylo_SILVA, function(x)(x/sum(x)*100))
+bacteria.RA_refseq <- transform_sample_counts(bacteria_phylo_REFSEQ, function(x)(x/sum(x)*100))
+bacteria.RA_nt <- transform_sample_counts(bacteria_phylo_NT, function(x)(x/sum(x)*100))
+bacteria.RA_gtdb <- transform_sample_counts(bacteria_phylo_GTDB, function(x)(x/sum(x)*100))
+
+
+# Replace NaN of samples with zero counts, for Zeroes
+bacteria.RA_silva@otu_table[is.nan(bacteria.RA_silva@otu_table)] <- 0
+bacteria.RA_refseq@otu_table[is.nan(bacteria.RA_refseq@otu_table)] <- 0
+bacteria.RA_nt@otu_table[is.nan(bacteria.RA_nt@otu_table)] <- 0
+bacteria.RA_gtdb@otu_table[is.nan(bacteria.RA_gtdb@otu_table)] <- 0
+
+
+##### to agglomerate your taxaplot to a singe taxonomic rank and convert to a dataframe 
+glom_B_silva <- tax_glom(bacteria.RA_silva, taxrank = 'Phylum', NArm=FALSE) 
+data_glom_B_silva<- psmelt(glom_B_silva) 	
+data_glom_B_silva$Phylum <- as.character(data_glom_B_silva$Phylum)
+
+glom_B_refseq <- tax_glom(bacteria.RA_refseq, taxrank = 'Phylum', NArm=FALSE) 
+data_glom_B_refseq<- psmelt(glom_B_refseq) 	
+data_glom_B_refseq$Phylum <- as.character(data_glom_B_refseq$Phylum)
+
+glom_B_nt <- tax_glom(bacteria.RA_nt, taxrank = 'Phylum', NArm=FALSE) 
+data_glom_B_nt<- psmelt(glom_B_nt) 	
+data_glom_B_nt$Phylum <- as.character(data_glom_B_nt$Phylum)
+
+glom_B_gtdb <- tax_glom(bacteria.RA_gtdb, taxrank = 'Phylum', NArm=FALSE) 
+data_glom_B_gtdb<- psmelt(glom_B_gtdb) 	
+data_glom_B_gtdb$Phylum <- as.character(data_glom_B_gtdb$Phylum) 	
+
+## taxonomic barplots in Figure 6A in manuscript
+
+bacteria_PHYLUM_silva <- ggplot(data=data_glom_B_silva, aes(x=Sample, y=Abundance, fill=Phylum)) + theme_bw()
+
+bacteria_silva <- bacteria_PHYLUM_silva + geom_bar(aes(), stat="identity", position="stack") + theme(legend.position = "none") + theme(axis.text.x = element_blank()) + theme(axis.title.y=element_blank()) + theme(axis.title.x=element_blank()) + theme(axis.text.y = element_text(size=17, face = "bold")) + theme(plot.title = element_text(face = "bold", size = 17)) + scale_y_continuous(labels = label_scientific(digits = 1), expand = expand_scale(mult = c(0, 0)))
+
+## taxonomic barplots in Figure 6B in manuscript
+
+bacteria_PHYLUM_refseq <- ggplot(data=data_glom_B_refseq, aes(x=Sample, y=Abundance, fill=Phylum)) + theme_bw()
+
+bacteria_refseq <- bacteria_PHYLUM_refseq + geom_bar(aes(), stat="identity", position="stack") + theme(legend.position = "none") + theme(axis.text.x = element_blank()) + theme(axis.title.y=element_blank()) + theme(axis.title.x=element_blank()) + theme(axis.text.y = element_text(size=17, face = "bold")) + theme(plot.title = element_text(face = "bold", size = 17)) + scale_y_continuous(labels = label_scientific(digits = 1), expand = expand_scale(mult = c(0, 0)))
+
+## taxonomic barplots in Figure 6C in manuscript
+
+bacteria_PHYLUM_nt <- ggplot(data=data_glom_B_nt, aes(x=Sample, y=Abundance, fill=Phylum)) + theme_bw()
+
+bacteria_nt <- bacteria_PHYLUM_nt + geom_bar(aes(), stat="identity", position="stack") + theme(legend.position = "none") + theme(axis.text.x = element_blank()) + theme(axis.title.y=element_blank()) + theme(axis.title.x=element_blank()) + theme(axis.text.y = element_text(size=17, face = "bold")) + theme(plot.title = element_text(face = "bold", size = 17)) + scale_y_continuous(labels = label_scientific(digits = 1), expand = expand_scale(mult = c(0, 0)))
+
+## taxonomic barplots in Figure 6D in manuscript
+
+bacteria_PHYLUM_gtdb <- ggplot(data=data_glom_B_gtdb, aes(x=Sample, y=Abundance, fill=Phylum)) + theme_bw()
+
+bacteria_gtdb <- bacteria_PHYLUM_gtdb + geom_bar(aes(), stat="identity", position="stack") + theme(legend.position = "none") + theme(axis.text.x = element_blank()) + theme(axis.title.y=element_blank()) + theme(axis.title.x=element_blank()) + theme(axis.text.y = element_text(size=17, face = "bold")) + theme(plot.title = element_text(face = "bold", size = 17)) + scale_y_continuous(labels = label_scientific(digits = 1), expand = expand_scale(mult = c(0, 0)))
+
